@@ -1,0 +1,456 @@
+#!/usr/bin/python
+
+import sip
+# Tell qt to return python string instead of QString
+# These are only needed for Python v2 but are harmless for Python v3.
+
+sip.setapi('QString', 2)
+sip.setapi('QVariant', 2)
+
+import optparse
+import signal
+import sys
+import os
+import threading
+from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
+import urlparse
+import json
+import requests
+import logging
+
+from ggpo.common.controller import Controller
+from ggpo.common.cliclient import CLI
+from ggpo.common.util import logdebug
+from PyQt4 import QtGui, QtCore
+
+
+daemon = None
+client = None
+
+
+class GGPOClientDaemonHTTPHandler(BaseHTTPRequestHandler):
+    def __init__(self, request, client_address, server):
+        self.daemon = server.daemon
+        self.controller = server.daemon.controller
+        BaseHTTPRequestHandler.__init__(self, request, client_address, server)
+
+    def do_PATCH(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+
+        if self.path == "/status":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            state = json.loads(data)
+            self.daemon.set_afk(int(state['afk']))
+
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+
+        if self.path == "/play":
+            self.controller.runFBA(self.controller.channel)
+            self.controller.sigStatusMessage.emit("Launching {}".format(self.controller.channel))
+
+        elif self.path == "/direct":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            name = obj["player"]
+            p = self.controller.players[name]
+            if (str(self.controller.username) < str(name)):
+                side=0
+                port1=6000
+                port2=6001
+            else:
+                side=1
+                port1=6001
+                port2=6000
+            quark = "quark:direct,"+str(self.controller.channel)+","+str(port1)+","+str(p.ip)+","+str(port2)+","+str(side)
+            self.controller.runFBA(quark)
+            self.controller.sigStatusMessage.emit("Direct match with {} @ {}".format(name, self.controller.channel))
+            self.controller.sendToggleAFK(1)
+
+        elif self.path == "/challenge":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.send_challenge(obj["player"])
+
+        elif self.path == "/accept":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.accept_challenge(obj["player"])
+
+        elif self.path == "/cancel":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.cancel_challenge(obj["player"])
+
+        elif self.path == "/decline":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.decline_challenge(obj["player"])
+
+        elif self.path == "/join":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.join(obj["channel"])
+
+        elif self.path == "/chat":
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            obj = json.loads(data)
+            self.daemon.send(obj["text"]);
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+
+        out = {}
+        if self.path == "/channels":
+            out = self.controller.channels
+
+        elif self.path == "/users":
+            users = {}
+            for name, player in self.controller.players.items():
+                users[name] = player.__dict__
+            out = users
+
+        elif self.path == "/status":
+            out = self.daemon.state
+
+        elif self.path == "/chat":
+            out = self.daemon.state["chat"]
+
+        res = json.dumps(out, sort_keys=True, ensure_ascii=False).encode('utf8')
+        self.wfile.write(res)
+
+
+class GGPOClientDaemon():
+    def __init__(self, login, password, listen_address, listen_port):
+        app = QtCore.QCoreApplication(sys.argv)
+        controller = Controller()
+        controller.sigMotdReceived.connect(self.on_motd_received)
+        controller.sigChannelsLoaded.connect(self.on_list_channels_received)
+        controller.sigChallengeReceived.connect(self.on_challenge_received)
+        controller.sigChallengeCancelled.connect(self.on_challenge_cancelled)
+        controller.sigChallengeDeclined.connect(self.on_challenge_declined)
+        controller.sigChatReceived.connect(self.on_chat_received)
+        controller.sigPlayerNewlyJoined.connect(self.on_player_joined)
+        controller.sigPlayerStateChange.connect(self.on_player_state_change)
+        controller.sigPlayersLoaded.connect(self.on_players_loaded)
+        controller.sigServerDisconnected.connect(self.on_server_disconnected)
+        controller.sigLoginSuccess.connect(self.on_login_success)
+
+        thread = QtCore.QThread()
+        controller.moveToThread(thread)
+        thread.started.connect(controller.selectLoop)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+        self.thread = thread
+        self.app = app
+        self.controller = controller
+        self.login = login
+        self.password = password
+        self.listen_address = listen_address
+        self.listen_port = listen_port
+        self.state = { "challenge_received": [], "challenge_sent": [], "afk": False, "chat": "", "players": {}, "connected": False }
+
+    def start(self):
+        self.thread.start()
+        self.connect()
+        self.controller.sendListChannels()
+        self.controller.sendListUsers()
+
+    def serve_forever(self):
+        self.webserver = HTTPServer((self.listen_address, self.listen_port), GGPOClientDaemonHTTPHandler)
+        self.webserver.daemon = self
+
+        logdebug().info('Starting http server on %s:%s/tcp' % (options.listen_address, str(self.listen_port)))
+        t = threading.Thread(target=self.webserver.serve_forever)
+        t.daemon = True
+        t.start()
+
+        self.app.exec_()
+
+    def connect(self):
+        UDP=False
+        port=6009
+        while True:
+            UDP = self.controller.connectUdp(port)
+            port=port-1
+            if (UDP==True or port < 6006):
+                break
+
+        self.controller.connectTcp()
+        self.controller.username = self.login
+        self.controller.password = self.password
+        self.controller.sendWelcome()
+        self.controller.sendAuth(self.login, self.password)
+
+    def on_login_success(self):
+        self.state["connected"] = True
+
+    def on_server_disconnected(self):
+        self.state["connected"] = False
+
+    def daemonize(self):
+        # Fork a child and end the parent (detach from parent)
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0) # End parent
+        except OSError, e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(-2)
+
+        # Change some defaults so the daemon doesn't tie up dirs, etc.
+        os.setsid()
+        os.umask(0)
+
+        # Fork a child and end parent (so init now owns process)
+        try:
+            pid = os.fork()
+            if pid > 0:
+                try:
+                    f = file('ggpodaemon.pid', 'w')
+                    f.write(str(pid))
+                    f.close()
+                except IOError, e:
+                    logging.error(e)
+                    sys.stderr.write(repr(e))
+                sys.exit(0) # End parent
+        except OSError, e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(-2)
+
+        # Close STDIN, STDOUT so we don't tie up the controlling terminal
+        for fd in (0, 1):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def stop(self):
+		print "-!- Stopping ggposrv"
+		logging.info("Stopping ggposrv")
+		pid = None
+		try:
+			f = file('ggpodaemon.pid', 'r')
+			pid = int(f.readline())
+			f.close()
+			os.unlink('ggpodaemon.pid')
+		except ValueError, e:
+			sys.stderr.write('Error in pid file `ggpodaemon.pid`. Aborting\n')
+			sys.exit(-1)
+		except IOError, e:
+			pass
+
+		if pid:
+			os.kill(pid, 15)
+		else:
+			sys.stderr.write('ggpodaemon not running or no PID file found\n')
+
+    def join(self, channel):
+        self.controller.sendJoinChannelRequest(channel)
+
+    def set_afk(self, state):
+        self.controller.sendToggleAFK(state)
+        self.state["afk"] = state
+
+    def decline_challenge(self, player):
+        self.controller.sendDeclineChallenge(player)
+        self.state["challenge_received"].remove(player)
+
+    def cancel_challenge(self, player):
+        self.controller.sendCancelChallenge(player)
+        self.state["challenge_sent"].remove(player)
+
+    def accept_challenge(self, player):
+        self.controller.sendAcceptChallenge(player)
+        self.state["challenge_received"].remove(player)
+
+    def send_challenge(self, player):
+        self.controller.sendChallenge(player)
+        self.state["challenge_sent"].append(player)
+
+    def send(self, txt):
+        print "Sending chat", txt
+        print "%s: %s\n" % (self.login, txt)
+        self.controller.sendChat(txt)
+
+    def on_motd_received(self, channel, topic, msg):
+        txt = "Welcome to channel %s\n\nTopic is %s\n%s" % (channel, topic, msg)
+        self.state["chat"] += txt
+        logdebug().debug(txt)
+
+    def on_list_channels_received(self):
+        logdebug().debug("Got channel list " + str(self.controller.channels))
+
+    def on_challenge_received(self, player):
+        logdebug().debug("Player %s is challenging you" % (player,))
+        self.state["challenge_received"].append(player)
+
+    def on_challenge_cancelled(self, player):
+        logdebug().debug("Player %s cancelled its challenge" % (player,))
+        self.state["challenge_received"].remove(player)
+
+    def on_challenge_declined(self, player):
+        logdebug().debug("Player %s declined your challenge" % (player,))
+        self.state["challenge_sent"].remove(player)
+
+    def on_chat_received(self, name, txt):
+        logdebug().debug("Received message from %s: %s" % (name, txt))
+        self.state["chat"] += "%s: %s\n" % (name, txt)
+
+    def on_players_loaded(self):
+        logdebug().debug("%d players" % (len(self.controller.players),))
+        for name, player in self.controller.players.items():
+            self.state["players"][name] = player.__dict__
+
+    def on_player_joined(self, player):
+        logdebug().debug("%s joined" % (player,))
+        for name, player in self.controller.players.items():
+            self.state["players"][name] = player.__dict__
+
+    def on_player_state_change(self, player, state):
+        logdebug().debug("%s changed state %d" % (player,state))
+        if state == 255:
+            del self.state["players"][player]
+
+
+class GGPOClient:
+    def __init__(self, address, port):
+        self.address = address
+        self.port = port
+
+    def list_channels(self):
+        r = requests.get("http://%s:%d/channels" % (self.address, self.port))
+        print r.text
+
+    def list_users(self):
+        r = requests.get("http://%s:%d/users" % (self.address, self.port))
+        print r.text
+
+    def set_afk(self, state):
+        r = requests.patch("http://%s:%d/status" % (self.address, self.port),
+                           data=json.dumps({"afk": int(state)}))
+
+    def status(self):
+        r = requests.get("http://%s:%d/status" % (self.address, self.port))
+        print r.text
+
+    def play(self):
+        r = requests.post("http://%s:%d/play" % (self.address, self.port))
+
+    def direct(self, player):
+        r = requests.post("http://%s:%d/direct" % (self.address, self.port),
+                          data=json.dumps({"player": player}))
+
+    def accept(self, player):
+        r = requests.post("http://%s:%d/accept" % (self.address, self.port),
+                          data=json.dumps({"player": player}))
+
+    def challenge(self, player):
+        r = requests.post("http://%s:%d/challenge" % (self.address, self.port),
+                          data=json.dumps({"player": player}))
+
+    def cancel(self, player):
+        r = requests.post("http://%s:%d/cancel" % (self.address, self.port),
+                          data=json.dumps({"player": player}))
+
+    def decline(self, player):
+        r = requests.post("http://%s:%d/decline" % (self.address, self.port),
+                          data=json.dumps({"player": player}))
+
+    def get_chat(self):
+        r = requests.get("http://%s:%d/chat" % (self.address, self.port))
+        print r.text.encode('utf-8')
+
+    def join(self, channel):
+        r = requests.post("http://%s:%d/join" % (self.address, self.port),
+                          data=json.dumps({"channel": channel}))
+
+    def send(self, txt):
+        r = requests.post("http://%s:%d/chat" % (self.address, self.port),
+                          data=json.dumps({"text": txt}))
+
+def get_daemon(options):
+    global daemon
+    if daemon == None:
+        daemon = GGPOClientDaemon(options.username, options.password,
+                                  options.listen_address, options.listen_port+1)
+    return daemon
+
+
+def get_client(options):
+    global client
+    if client == None:
+        client = GGPOClient(options.listen_address, options.listen_port+1)
+    return client
+
+
+if __name__ == "__main__":
+    parser = optparse.OptionParser()
+    parser.set_usage(sys.argv[0] + " [options] (start | stop | restart | list-channels | " \
+                                   "list-users | afk | available | play | direct | status | " \
+                                   "challenge | accept | cancel | decline | chat)")
+
+    parser.add_option("--username", dest="username", default="johndoe", help="GGPO username")
+    parser.add_option("--password", dest="password", default="", help="GGPO password")
+    parser.add_option("-a", "--address", dest="listen_address", action="store", default='0.0.0.0', help="IP to listen on")
+    parser.add_option("-p", "--port", dest="listen_port", action="store", default='7000', help="Port to listen on (default=7000)")
+    parser.add_option("-f", "--foreground", dest="foreground", action="store_true", default=False, help="Do not go into daemon mode.")
+
+    options, args = parser.parse_args()
+    options.listen_port=int(options.listen_port)
+
+    if len(args) < 1:
+        parser.print_help()
+        sys.exit(1)
+
+    command = args[0]
+    if command == "start":
+        if not options.username:
+            print "Invalid username:", options.username
+            sys.exit(1)
+        if not options.foreground:
+            get_daemon(options).daemonize()
+        get_daemon(options).start()
+        get_daemon(options).serve_forever()
+    elif command == "stop":
+        get_daemon(options).stop()
+    elif command == "restart":
+        get_daemon(options).stop()
+        get_daemon(options).start()
+    elif command == "list-channels":
+        get_client(options).list_channels()
+    elif command == "list-users":
+        get_client(options).list_users()
+    elif command == "afk":
+        get_client(options).set_afk(1)
+    elif command == "available":
+        get_client(options).set_afk(0)
+    elif command == "play":
+        get_client(options).play()
+    elif command == "direct":
+        get_client(options).direct(args[1])
+    elif command == "status":
+        get_client(options).status()
+    elif command == "challenge":
+        get_client(options).challenge(args[1])
+    elif command == "accept":
+        get_client(options).accept(args[1])
+    elif command == "cancel":
+        get_client(options).cancel(args[1])
+    elif command == "decline":
+        get_client(options).decline(args[1])
+    elif command == "chat":
+        get_client(options).get_chat()
+    elif command == "join":
+        get_client(options).join(args[1])
+    elif command == "send":
+        get_client(options).send(" ".join(args[1:]))
+    else:
+        print "Unknown command", command
+        sys.exit(1)
